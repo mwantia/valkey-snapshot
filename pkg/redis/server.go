@@ -3,12 +3,13 @@ package redis
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"time"
 
+	"github.com/go-redis/redis/v8"
 	"github.com/minio/minio-go/v7"
 	"github.com/mwantia/valkey-snapshot/pkg/backend"
 	"github.com/mwantia/valkey-snapshot/pkg/config"
@@ -21,83 +22,107 @@ func Start(cfg *config.SnapshotServerConfig) error {
 		return err
 	}
 
-	go DoBeginGoroutine(client, cfg)
+	go BeginGoroutine(client, cfg)
 
-	http.HandleFunc("/health", handle.HandleHealth())
+	http.HandleFunc("/health", handle.Health())
+	http.Handle("/", handle.Handle(cfg))
 
 	log.Printf("Starting server on '%s'", cfg.Address)
 	return http.ListenAndServe(cfg.Address, nil)
 }
 
-func DoBeginGoroutine(client *backend.S3BackendClient, cfg *config.SnapshotServerConfig) {
+func BeginGoroutine(client *backend.S3BackendClient, cfg *config.SnapshotServerConfig) {
 	interval, err := time.ParseDuration(cfg.Interval)
 	if err != nil {
-		log.Fatal(fmt.Errorf("unable to parse scrape interval '%s'", cfg.Interval))
+		log.Fatalf("unable to parse scrape interval '%s'", cfg.Interval)
 	}
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
-		for _, endpoint := range cfg.Endpoints {
-			go func(endpoint config.SnapshotEndpointConfig) {
-				conn, err := net.Dial("tcp", endpoint.Endpoint)
-				if err != nil {
-					log.Printf("Failed to connect to Redis endpoint: %v", err)
-				}
-				defer conn.Close()
-
-				_, err = conn.Write([]byte("PSYNC ? -1\r\n"))
-				if err != nil {
-					log.Printf("Failed to send PSYNC command: %v", err)
-				}
-
-				timestamp := time.Now().Format(cfg.TimestampFormat)
-				name := fmt.Sprintf("%s/snapshot_%s.rdb", endpoint.Name, timestamp)
-
-				fmt.Println("Receiving RDB snapshot...")
-				const readTimeout = 5 * time.Second
-
-				var buffer bytes.Buffer
-				buf := make([]byte, 4096)
-
-				for {
-					// Set a read deadline; if no data is received within 5 seconds, the read will fail
-					if err := conn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
-						log.Fatalf("Failed to set read deadline: %v", err)
-					}
-
-					// Read from the connection
-					n, err := conn.Read(buf)
-					if err != nil {
-						// If the error is a timeout, we assume the transfer is complete
-						if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-							fmt.Println("No data received for 5 seconds. Ending snapshot transfer.")
-							break
-						}
-						log.Fatalf("Error receiving RDB snapshot: %v", err)
-					}
-
-					// Write received data to the file
-					if _, err := buffer.Write(buf[:n]); err != nil {
-						log.Fatalf("Error writing data to file: %v", err)
-					}
-				}
-
-				fmt.Println("RDB snapshot received successfully.")
-				fmt.Println("Uploading RDB snapshot to MinIO...")
-
-				size := int64(buffer.Len())
-				_, err = client.Minio.PutObject(context.Background(), client.Config.Bucket, name, &buffer, size, minio.PutObjectOptions{
-					ContentType: "application/octet-stream",
-				})
-				if err != nil {
-					log.Printf("Failed to upload RDB snapshot to MinIO: %v", err)
-				}
-
-				fmt.Println("RDB snapshot uploaded to MinIO successfully.")
-			}(endpoint)
+		if err := RunGoroutine(client, cfg); err != nil {
+			log.Fatalf("unable to continue goroutine: %v", err)
 		}
 		<-ticker.C
 	}
+}
+
+func RunGoroutine(client *backend.S3BackendClient, cfg *config.SnapshotServerConfig) error {
+	for _, endpoint := range cfg.Endpoints {
+		go func(endpoint config.SnapshotEndpointConfig) {
+			rdb := CreateClient(endpoint)
+			ctx := context.Background()
+
+			fmt.Printf("Creating snapshot for '%s'\n", endpoint.Name)
+
+			snapshot, err := CreateSnapshot(ctx, rdb, endpoint)
+			if err != nil {
+				fmt.Printf("Unable to create snapshot: %v\n", err)
+			}
+
+			fmt.Println("Snapshot created successfully")
+			fmt.Println("Uploading snapshot to backend")
+
+			name := fmt.Sprintf("%s/%v/snapshot_%s.json", endpoint.Name, endpoint.Database, snapshot.Metadata.CreatedAt.Format(cfg.TimestampFormat))
+			if err := UploadSnapshot(ctx, *client, name, snapshot); err != nil {
+				fmt.Printf("Unable to upload snapshot: %v\n", err)
+			}
+
+			fmt.Println("Snapshot uploaded successfully")
+		}(endpoint)
+	}
+	return nil
+}
+
+func CreateSnapshot(ctx context.Context, rdb *redis.Client, cfg config.SnapshotEndpointConfig) (config.Snapshot, error) {
+	snapshot := config.Snapshot{
+		Metadata: config.SnapshotMetadata{
+			Name:      cfg.Name,
+			Endpoint:  cfg.Endpoint,
+			Database:  cfg.Database,
+			CreatedAt: time.Now(),
+		},
+		Keys: make([]config.SnapshotKey, 0),
+	}
+
+	var cursor uint64
+	for {
+		keys, next, err := ScanKeys(ctx, rdb, cursor, cfg)
+		if err != nil {
+			return snapshot, err
+		}
+
+		for _, key := range keys {
+			snapshotKey, err := GetSnapshotKey(ctx, rdb, key)
+			if err != nil {
+				continue
+			}
+
+			snapshot.Keys = append(snapshot.Keys, snapshotKey)
+			snapshot.Metadata.Count++
+		}
+
+		if next == 0 {
+			break
+		}
+		cursor = next
+	}
+
+	return snapshot, nil
+}
+
+func UploadSnapshot(ctx context.Context, client backend.S3BackendClient, name string, snapshot config.Snapshot) error {
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		return err
+	}
+
+	size := int64(len(data))
+	reader := bytes.NewReader(data)
+
+	_, err = client.Minio.PutObject(ctx, client.Config.Bucket, name, reader, size, minio.PutObjectOptions{
+		ContentType: "application/json",
+	})
+	return err
 }

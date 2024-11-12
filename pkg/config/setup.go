@@ -18,8 +18,11 @@ type SnapshotServerConfig struct {
 }
 
 type SnapshotEndpointConfig struct {
-	Name     string `mapstructure:"name"`
-	Endpoint string `mapstructure:"endpoint"`
+	Name      string `mapstructure:"name"`
+	Endpoint  string `mapstructure:"endpoint"`
+	Password  string `mapstructure:"password"`
+	Database  int    `mapstructure:"database"`
+	BatchSize int64  `mapstructure:"batchsize"`
 }
 
 type SnapshotBackendConfig struct {
@@ -101,6 +104,10 @@ func (c *SnapshotServerConfig) Validate() error {
 
 	uniques := make(map[string]bool)
 	for _, endpoint := range c.Endpoints {
+		if endpoint.BatchSize == 0 {
+			endpoint.BatchSize = 1000
+		}
+
 		if uniques[endpoint.Name] {
 			return fmt.Errorf("duplicate endpoint name found: %s", endpoint.Name)
 		}
